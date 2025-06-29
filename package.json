@@ -1,0 +1,19 @@
+{
+  "name": "waka-linebot",
+  "version": "1.0.0",
+  "description": "Waka.AI LINE Bot",
+  "main": "index_refactored.js",
+  "scripts": {
+    "start": "node index_refactored.js"
+  },
+  "dependencies": {
+    "@line/bot-sdk": "^7.5.0",
+    "axios": "^1.7.3",
+    "dotenv": "^16.5.1",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "license": "MIT"
+}
