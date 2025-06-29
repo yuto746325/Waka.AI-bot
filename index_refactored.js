@@ -84,6 +84,10 @@ const trimByToken = (arr, maxToken = 4000) => {
 //  メインメッセージ処理
 //========================
 async function handleEvent(event) {
+// handleEvent の冒頭すぐ
+console.log('🔍 incoming userId:', event.source.userId);
+console.log('🔍 expected motherId:', MOTHER_USER_ID);
+
   if (event.type !== 'message' || event.message.type !== 'text') {
     return null;    // テキスト以外は無視
   }
