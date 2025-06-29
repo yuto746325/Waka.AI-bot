@@ -1,202 +1,251 @@
 // index_refactored.js – Waka.AI LINE Bot (Render / Node ≥14 対応)
 // ------------------------------------------------------------
-// ● 追加: ルート '/' で 200 OK を返すヘルスチェック
-//   Render の Health Check が署名ヘッダ無しで叩くため、LINE SDK の署名検証をバイパス。
-// ● 既存リファクタリング（token 長制御・model env・非同期 I/O・function calling）は維持
+// 変更点（パターン A）
+//   1. 署名検証ミドルウェアを `/webhook` のみに適用
+//   2. ルート `/` はヘルスチェック専用（署名検証しない）
 // ------------------------------------------------------------
 
 require('dotenv').config();
-const express = require('express');
-const axios = require('axios');
-const fs = require('fs').promises;
+const express   = require('express');
+const axios     = require('axios');
+const fs        = require('fs').promises;
 const { middleware, Client } = require('@line/bot-sdk');
-const { createHash } = require('crypto');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ファイルパス定数
-const HISTORY_FILE = './history.json';
+const HISTORY_FILE        = './history.json';
 const MOTHER_PROFILE_FILE = './mother_profile.json';
-const YUTO_PROFILE_FILE = './yuto_profile.json';
-const PENDING_REPLY_FILE = './pending_reply_to_mother.json';
+const YUTO_PROFILE_FILE   = './yuto_profile.json';
+const PENDING_REPLY_FILE  = './pending_reply_to_mother.json';
 
-// 固定ユーザー ID
 const MOTHER_USER_ID = 'Ubad10f224134c8f26da25d59730c0b5d';
 const YUTO_USER_ID   = 'U6f600038828ff8d3257b52a5d6c17284';
 
-// LINE SDK クライアント設定
-const lineConfig = {
+const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret:      process.env.LINE_CHANNEL_SECRET
 };
-if (!lineConfig.channelAccessToken || !lineConfig.channelSecret) {
-  throw new Error('LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET が .env に定義されていません');
-}
 
-const client = new Client(lineConfig);
-app.use(middleware(lineConfig));
-app.use(express.json());
+const client = new Client(config);
 
-// ---------- ヘルスチェック ----------
-app.get('/', (req, res) => res.status(200).send('OK')); // Render 用
+//------------------------
+// 1. ヘルスチェック用 GET /
+//------------------------
+app.get('/', (req, res) => res.status(200).send('OK'));
 
-// ---------- ユーティリティ ----------
-const TOKEN_LIMIT = 4000; // ざっくり 1token ≒ 4文字換算
+//-------------------------------------------
+// 2. 署名検証ミドルウェアを /webhook だけに適用
+//-------------------------------------------
+app.use('/webhook', middleware(config));
 
-async function readJsonSafe(path, fallback = {}) {
-  try {
-    const txt = await fs.readFile(path, 'utf8');
-    return JSON.parse(txt);
-  } catch {
-    return fallback;
-  }
-}
-
-async function writeJsonSafe(path, data) {
-  await fs.writeFile(path, JSON.stringify(data, null, 2));
-}
-
-function truncateByToken(arr) {
-  // 超簡易: UTF-8 長で概算 1/4
-  let total = 0;
-  const out = [];
-  for (let i = arr.length - 1; i >= 0; i--) {
-    const t = arr[i];
-    total += t.content.length / 4;
-    if (total > TOKEN_LIMIT) break;
-    out.unshift(t);
-  }
-  return out;
-}
-
-// ---------- 履歴・プロフィール操作 ----------
-async function loadHistory(userId) {
-  const data = await readJsonSafe(HISTORY_FILE, {});
-  return data[userId] || [];
-}
-
-async function saveHistory(userId, history) {
-  const data = await readJsonSafe(HISTORY_FILE, {});
-  data[userId] = history;
-  await writeJsonSafe(HISTORY_FILE, data);
-}
-
-const loadMotherProfile = () => readJsonSafe(MOTHER_PROFILE_FILE, {});
-const loadYutoProfile   = () => readJsonSafe(YUTO_PROFILE_FILE, {});
-const savePendingReply  = (d) => writeJsonSafe(PENDING_REPLY_FILE, d);
-const loadPendingReply  = () => readJsonSafe(PENDING_REPLY_FILE, null);
-const clearPendingReply = () => fs.unlink(PENDING_REPLY_FILE).catch(() => {});
-
-// ---------- OpenAI 呼び出し ----------
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o';
-const OPENAI_URL   = 'https://api.openai.com/v1/chat/completions';
-const OPENAI_HEADERS = {
-  'Content-Type': 'application/json',
-  'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
-};
-
-async function chatCompletion(messages, functions = undefined) {
-  const body = { model: OPENAI_MODEL, messages };
-  if (functions) body.functions = functions;
-  const res = await axios.post(OPENAI_URL, body, { headers: OPENAI_HEADERS });
-  return res.data.choices[0];
-}
-
-// ---------- Webhook ----------
+//------------------------
+// 3. /webhook POST ハンドラ
+//------------------------
 app.post('/webhook', async (req, res) => {
   try {
-    const results = await Promise.all(req.body.events.map(handleEvent));
-    res.json(results);
+    const results = await Promise.all(
+      req.body.events.map(handleEvent)
+    );
+    return res.json(results);
   } catch (err) {
     console.error('Webhook Error:', err);
-    res.status(500).end();
+    return res.status(500).end();
   }
 });
 
+//========================
+//  以下ユーティリティ
+//========================
+const loadJSON = async (path, fallback) => {
+  try {
+    const data = await fs.readFile(path, 'utf8');
+    return JSON.parse(data);
+  } catch (_) {
+    return fallback;
+  }
+};
+const saveJSON = async (path, obj) =>
+  fs.writeFile(path, JSON.stringify(obj, null, 2));
+
+// token 数で履歴制御（ざっくり 4 文字 = 1 token 換算）
+const trimByToken = (arr, maxToken = 4000) => {
+  let total = 0;
+  const out = [];
+  for (let i = arr.length - 1; i >= 0; i--) {
+    total += [...arr[i].content].length / 4;
+    if (total > maxToken) break;
+    out.unshift(arr[i]);
+  }
+  return out;
+};
+
+//========================
+//  メインメッセージ処理
+//========================
 async function handleEvent(event) {
-  if (event.type !== 'message' || event.message.type !== 'text') return null;
+  if (event.type !== 'message' || event.message.type !== 'text') {
+    return null;    // テキスト以外は無視
+  }
 
   const userId      = event.source.userId;
   const userMessage = event.message.text.trim();
-  const isMother = userId === MOTHER_USER_ID;
-  const isYuto   = userId === YUTO_USER_ID;
+  const isMother    = userId === MOTHER_USER_ID;
+  const isYuto      = userId === YUTO_USER_ID;
 
-  // "はい" で pending 送信
+  // ------------- プロファイル読み込み
+  const motherProfile = await loadJSON(MOTHER_PROFILE_FILE, {});
+  const yutoProfile   = await loadJSON(YUTO_PROFILE_FILE, {});
+
+  // ------------- 「はい」で pending 返信を確定
   if (isYuto && userMessage.toLowerCase() === 'はい') {
-    const pending = await loadPendingReply();
-    if (pending?.message) {
-      await clearPendingReply();
-      await client.pushMessage(MOTHER_USER_ID, { type: 'text', text: pending.message });
-      return client.replyMessage(event.replyToken, { type: 'text', text: 'お母様にお伝えしました。' });
+    const pending = await loadJSON(PENDING_REPLY_FILE, null);
+    if (pending && pending.message) {
+      await fs.unlink(PENDING_REPLY_FILE).catch(()=>{});
+      await client.pushMessage(MOTHER_USER_ID, {
+        type: 'text',
+        text: pending.message
+      });
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: 'お母様にお伝えしました。'
+      });
     }
   }
 
-  // @report コマンド
-  if (isYuto && /^@report$/.test(userMessage)) {
-    const mothHist = await loadHistory(MOTHER_USER_ID);
-    const recent   = mothHist.slice(-30);
-    const last15   = recent.filter(m => m.role === 'user' || m.role === 'assistant').slice(-15);
+  // ------------- @report で近況レポート
+  if (isYuto && (/^@report$/.test(userMessage) || /母の近況/.test(userMessage))) {
+    const motherHist = await loadJSON(HISTORY_FILE, {})[MOTHER_USER_ID] || [];
+    const recent     = motherHist.slice(-30);
+    const last15     = recent.filter(m => m.role === 'user' || m.role === 'assistant').slice(-15);
 
     const prompt = [
-      { role: 'system', content: 'あなたはAI仲介者のWakaです。以下の会話から母の近況をやさしく報告してください。' },
-      { role: 'user',   content: last15.map(m => `${m.role === 'user' ? '母' : 'Waka'}: ${m.content}`).join('\n') }
+      { role:'system', content:'あなたはAI仲介者のWakaです。以下の会話から母の近況をやさしい口調でYutoさんに報告してください。' },
+      { role:'user',   content: last15.map(m=>`${m.role==='user'?'母':'Waka'}: ${m.content}`).join('\\n') }
     ];
 
     try {
-      const sum = (await chatCompletion(prompt)).message.content;
+      const summaryRes = await axios.post(
+        'https://api.openai.com/v1/chat/completions',
+        { model: process.env.OPENAI_MODEL || 'gpt-4o', messages: prompt },
+        { headers:{ Authorization:`Bearer ${process.env.OPENAI_API_KEY}` } }
+      );
+      const summary = summaryRes.data.choices[0].message.content;
+
       await client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: `【母との最近のやり取り】\n\n${last15.map(m => `${m.role === 'user' ? '母' : 'Waka'}: ${m.content}`).join('\n')}\n\n【まとめ】\n${sum}`
+        type:'text',
+        text:`【母との最近のやり取り】\\n\\n${last15.map(m=>`${m.role==='user'?'母':'Waka'}: ${m.content}`).join('\\n')}\\n\\n【まとめ】\\n${summary}`
       });
+      return;
     } catch (err) {
-      const safeMsg = err?.response?.data ?? err.message;
-      console.error('Report Error:', safeMsg);
-      await client.replyMessage(event.replyToken, { type: 'text', text: 'レポート生成中にエラーが発生しました。' });
+      console.error('Report Error:', err && err.response && err.response.data ? err.response.data : err.message);
+      return client.replyMessage(event.replyToken, {
+        type:'text',
+        text:'レポート生成中にエラーが発生しました。時間をおいて再度お試しください。'
+      });
     }
-    return;
   }
 
-  // 通常メッセージ処理
-  let history = await loadHistory(userId);
-  history.push({ role: 'user', content: userMessage });
-  history = truncateByToken(history);
+  // ------------- 履歴操作
+  const fullHistory = await loadJSON(HISTORY_FILE, {});
+  const history = trimByToken(
+    (fullHistory[userId] || []).concat({ role:'user', content: userMessage })
+  );
+  fullHistory[userId] = history;
+  await saveJSON(HISTORY_FILE, fullHistory);
 
-  const motherProfile = await loadMotherProfile();
-  const yutoProfile   = await loadYutoProfile();
+  // ------------- systemPrompt
+  const systemPrompt = isMother ? `
+あなたは「和架（Waka）」という名前のAI仲介者です。
 
-  const systemPrompt = isMother ? `あなたは「和架（Waka）」という名前のAI仲介者です。\n...（省略: 母用プロンプト全文）` : `あなたは「和架（Waka）」という名前のAI仲介者です。\n...（省略: 裕智用プロンプト全文）`;
+あなたの役割は、母親ユーザーに寄り添い、健康不安や感情の波を受け止め、落ち着かせることです。
 
-  const messages = [{ role: 'system', content: systemPrompt }, ...history];
+- 健康不安には医学的観点から安心を与え、
+- パニック予防・緩和に努め、
+- 息子への負担軽減を第一に考えます。
+- 母親の気持ちが不安定なときには、対話を重ねて状況を把握しようとしてください。
+- 状況を深く理解するために、相手に質問を返す形での対話を重視してください。
+- 「裕智に伝えて」と言われた場合でも、すぐに伝えず、一度内容を聞き返して整理し、必要であれば要点をまとめてから本人に確認を取ってください。
 
+報告が必要だと判断した場合:
+- まず母とのやりとりを振り返り、その内容を要約・整理してください。
+- 整理された内容を、裕智さんが理解しやすいように丁寧にまとめてください。
+- 送信が必要な場合は、応答の冒頭に必ず「【裕智に報告推奨】」を付け、その後にまとめた報告文を記載してください。
+
+注意:
+- 母の言葉をそのままコピーせず、会話全体から主旨を読み取り、文脈を整えた上で報告してください。
+- 高瀬院長の判断を尊重し、気軽な外出や医療判断は勧めないようにしてください。
+
+母のプロフィール:
+${JSON.stringify(motherProfile)}
+
+裕智さんのプロフィール:
+${JSON.stringify(yutoProfile)}
+` : `
+あなたは「和架（Waka）」という名前のAI仲介者です。
+現在、開発者（裕智）と会話しています。システムテストや指示に冷静に対応してください。
+ユーザーの発言が「母への伝達依頼」であるかどうかを判断し、依頼と判断された場合はその内容を整理して提案文を作成してください。その後、承認された場合のみ送信してください。
+`;
+
+  //------------------ OpenAI 呼び出し
   try {
-    const aiRes = await chatCompletion(messages);
-    const aiReply = aiRes.message.content;
+    const messagesToSend = [
+      { role:'system', content: systemPrompt },
+      ...history
+    ];
 
-    // 報告・伝達フラグ判定
+    const openaiRes = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: process.env.OPENAI_MODEL || 'gpt-4o',
+        messages: messagesToSend
+      },
+      { headers:{ Authorization:`Bearer ${process.env.OPENAI_API_KEY}` } }
+    );
+
+    const aiReply = openaiRes.data.choices[0].message.content;
+
+    // 報告推奨 → Yuto に push
     if (isMother && aiReply.includes('【裕智に報告推奨】')) {
-      const body = aiReply.replace('【裕智に報告推奨】', '').trim();
-      await client.pushMessage(YUTO_USER_ID, { type: 'text', text: `【和架からの報告】\n\n${body}` });
+      const msgToYuto = aiReply.replace('【裕智に報告推奨】','').trim();
+      await client.pushMessage(YUTO_USER_ID, {
+        type:'text',
+        text:`【和架からの報告】\\n\\n${msgToYuto}`
+      });
     }
-    if (isYuto && aiReply.startsWith('【母への伝達提案】')) {
-      const msg = aiReply.replace('【母への伝達提案】', '').trim();
-      await savePendingReply({ message: msg });
-      await client.replyMessage(event.replyToken, { type: 'text', text: `お母様にはこのように伝えます:\n\n${msg}\n\nよろしければ「はい」とお返事ください。` });
-    } else {
-      await client.replyMessage(event.replyToken, { type: 'text', text: aiReply.replace('【裕智に報告推奨】', '').trim() });
+    // 伝達提案 → pending 保存
+    else if (isYuto && aiReply.startsWith('【母への伝達提案】')) {
+      const proposed = aiReply.replace('【母への伝達提案】','').trim();
+      await saveJSON(PENDING_REPLY_FILE, { message: proposed });
+      return client.replyMessage(event.replyToken, {
+        type:'text',
+        text:`お母様にはこのように伝えようと思います：\\n\\n${proposed}\\n\\nこの内容でよろしければ「はい」とお返事ください。`
+      });
     }
 
-    history.push({ role: 'assistant', content: aiReply });
-    history = truncateByToken(history);
-    await saveHistory(userId, history);
+    // 履歴保存
+    fullHistory[userId] = trimByToken(
+      history.concat({ role:'assistant', content: aiReply })
+    );
+    await saveJSON(HISTORY_FILE, fullHistory);
+
+    return client.replyMessage(event.replyToken, {
+      type:'text',
+      text: aiReply.replace('【裕智に報告推奨】','').trim()
+    });
   } catch (err) {
-    const safeMsg = err?.response?.data ?? err.message;
-    console.error('OpenAI Error:', safeMsg);
-    await client.replyMessage(event.replyToken, { type: 'text', text: 'エラーが発生しました。少し時間をおいて再度お試しください。' });
+    const safeMsg = (err && err.response && err.response.data)
+      ? err.response.data
+      : err.message;
+    console.error('OpenAI API Error:', safeMsg);
+    return client.replyMessage(event.replyToken, {
+      type:'text',
+      text:'エラーが発生しました。時間をおいて再度お試しください。'
+    });
   }
 }
 
-// ---------- Start Server ----------
+//------------------------
 app.listen(PORT, () => {
   console.log(`Waka.AI Bot running on ${PORT}`);
 });
