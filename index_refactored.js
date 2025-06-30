@@ -253,3 +253,16 @@ ${JSON.stringify(yutoProfile)}
 app.listen(PORT, () => {
   console.log(`Waka.AI Bot running on ${PORT}`);
 });
+// ------------- TEST: Ping Mongo once at startup -------------
+(async () => {
+  try {
+    const { MongoClient } = require('mongodb');
+    const client = new MongoClient(process.env.MONGODB_URI);
+    await client.db().command({ ping: 1 });
+    console.log('✅ Connected to MongoDB (startup ping)');
+    await client.close();
+  } catch (e) {
+    console.error('🛑 MongoDB connection failed:', e.message);
+  }
+})();
+
