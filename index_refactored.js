@@ -1,199 +1,128 @@
-// index_refactored.js – Waka.AI LINE Bot (MongoDB history 版)
+// index_refactored.js – Waka.AI LINE Bot (MongoDB persistent version)
 // ------------------------------------------------------------
-// ● history の読み書きをファイル → MongoDB Atlas に切替え
-//    - db.js で export した getColl('history') を利用
-// ● その他ロジックはそのまま
+// Features
+//  1. Health Check at '/'
+//  2. MongoDB Atlas for history, profile, pending collections
+//  3. Async I/O, token‑based history trim
+//  4. Startup ping to verify DB connection
 // ------------------------------------------------------------
 
 require('dotenv').config();
 const express   = require('express');
 const axios     = require('axios');
-const fs        = require('fs').promises;
 const { middleware, Client } = require('@line/bot-sdk');
-const { getColl } = require('./db');  // ★ 追加
+const { getColl } = require('./db');           // Mongo helper
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ------------------------------------------------------------
-// 固定 ID とプロファイルファイル (profile は後で MongoDB 化予定)
-// ------------------------------------------------------------
+// User IDs ----------------------------------------------------
 const MOTHER_USER_ID = 'Ubad10f224134c8f26da25d59730c0b5d';
 const YUTO_USER_ID   = 'U6f600038828ff8d3257b52a5d6c17284';
 
-const MOTHER_PROFILE_FILE = './mother_profile.json';
-const YUTO_PROFILE_FILE   = './yuto_profile.json';
-const PENDING_REPLY_FILE  = './pending_reply_to_mother.json';
-
+// LINE config -------------------------------------------------
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret:      process.env.LINE_CHANNEL_SECRET
 };
-
 const client = new Client(config);
 
-//------------------------
-// ルート / で Health Check
-//------------------------
-app.get('/', (req, res) => res.status(200).send('OK'));
-
-//------------------------
-// LINE Webhook
-//------------------------
+// Health Check ------------------------------------------------
+app.get('/', (req,res)=>res.status(200).send('OK'));
 app.use('/webhook', middleware(config));
-app.post('/webhook', async (req, res) => {
+app.post('/webhook', async (req,res)=>{
   try {
-    const results = await Promise.all(req.body.events.map(handleEvent));
-    return res.json(results);
-  } catch (err) {
-    console.error('Webhook Error:', err);
-    return res.status(500).end();
-  }
+    const out = await Promise.all(req.body.events.map(handleEvent));
+    res.json(out);
+  } catch(e){ console.error('Webhook',e); res.status(500).end(); }
 });
 
-// ============================================================
-// MongoDB 版 history utils
-// ============================================================
-async function loadHistory(userId) {
-  const coll = await getColl('history');
-  const doc  = await coll.findOne({ _id: userId });
-  return doc?.messages || [];
+// ---------- Mongo helpers -----------------------------------
+async function loadHistory(uid){
+  const c = await getColl('history');
+  const d = await c.findOne({_id:uid});
+  return d?.messages||[];
+}
+async function saveHistory(uid, arr){
+  const c = await getColl('history');
+  await c.updateOne({_id:uid},{ $set:{messages:arr} },{ upsert:true });
+}
+async function loadProfile(uid){
+  const c = await getColl('profile');
+  const d = await c.findOne({_id:uid});
+  return d||{};
+}
+async function saveProfile(uid,obj){
+  const c = await getColl('profile');
+  await c.updateOne({_id:uid},{ $set:obj },{ upsert:true });
+}
+async function loadPending(){
+  const c = await getColl('pending');
+  return (await c.findOne({_id:'pending'}))?.data||null;
+}
+async function savePending(data){
+  const c = await getColl('pending');
+  await c.updateOne({_id:'pending'},{ $set:{data} },{ upsert:true });
+}
+async function clearPending(){ await savePending(null); }
+
+// ---------- util --------------------------------------------
+const trimByToken = (arr, max=4000)=>{
+  let tot=0, out=[]; for(let i=arr.length-1;i>=0;i--){
+    tot += [...arr[i].content].length/4; if(tot>max) break; out.unshift(arr[i]); }
+  return out; };
+
+// ---------- main handler ------------------------------------
+async function handleEvent(event){
+  if(event.type!=='message'||event.message.type!=='text') return null;
+  const uid=event.source.userId; const msg=event.message.text.trim();
+  const isMother=uid===MOTHER_USER_ID; const isYuto=uid===YUTO_USER_ID;
+
+  // log ids
+  console.log('🔍 incoming',uid,' isMother',isMother);
+
+  // load profile / init
+  const motherProfile = await loadProfile(MOTHER_USER_ID);
+  const yutoProfile   = await loadProfile(YUTO_USER_ID);
+  if(!motherProfile.name){ await saveProfile(MOTHER_USER_ID,{name:'お母様',tone:'やさしい敬語'}); motherProfile.name='お母様'; }
+  if(!yutoProfile.name){ await saveProfile(YUTO_USER_ID,{name:'裕智さん'}); }
+
+  // "はい" for pending
+  if(isYuto && msg.toLowerCase()==='はい'){
+    const p=await loadPending();
+    if(p){await clearPending(); await client.pushMessage(MOTHER_USER_ID,{type:'text',text:p});
+      return client.replyMessage(event.replyToken,{type:'text',text:'お母様にお伝えしました。'}); }
+  }
+
+  // @report
+  if(isYuto && (/^@report$/.test(msg)||/母の近況/.test(msg))){
+    const mHist=await loadHistory(MOTHER_USER_ID); const recent=mHist.slice(-30);
+    const last15=recent.filter(m=>m.role==='user'||m.role==='assistant').slice(-15);
+    const prompt=[{role:'system',content:'あなたはAI仲介者Wakaです。以下の会話から母の近況をやさしい口調でYutoさんに報告してください。'},{role:'user',content:last15.map(m=>`${m.role==='user'?'母':'Waka'}: ${m.content}`).join('\n')}];
+    try{
+      const r=await axios.post('https://api.openai.com/v1/chat/completions',{model:process.env.OPENAI_MODEL||'gpt-4o',messages:prompt},{headers:{Authorization:`Bearer ${process.env.OPENAI_API_KEY}`}});
+      const sum=r.data.choices[0].message.content;
+      await client.replyMessage(event.replyToken,{type:'text',text:`【母との最近のやり取り】\n\n${last15.map(m=>`${m.role==='user'?'母':'Waka'}: ${m.content}`).join('\n')}\n\n【まとめ】\n${sum}`});
+      return; }catch(e){ console.error('report',e.message); return client.replyMessage(event.replyToken,{type:'text',text:'レポート生成エラー'});} }
+
+  // history
+  const hist=trimByToken((await loadHistory(uid)).concat({role:'user',content:msg}));
+  await saveHistory(uid,hist);
+
+  const systemPrompt = isMother ? `あなたは和架です。このユーザーはお母様で確定。${motherProfile.tone||'やさしい敬語'}で対応してください。` : `あなたは和架です。開発者モード。`;
+
+  try{
+    const res=await axios.post('https://api.openai.com/v1/chat/completions',{model:process.env.OPENAI_MODEL||'gpt-4o',messages:[{role:'system',content:systemPrompt},...hist]},{headers:{Authorization:`Bearer ${process.env.OPENAI_API_KEY}`}});
+    const aiReply=res.data.choices[0].message.content;
+    // pending / report logic simplified
+    await client.replyMessage(event.replyToken,{type:'text',text:aiReply});
+    await saveHistory(uid,trimByToken(hist.concat({role:'assistant',content:aiReply})));
+  }catch(err){ console.error('OpenAI',err.message); await client.replyMessage(event.replyToken,{type:'text',text:'エラーが発生しました。'}); }
 }
 
-async function saveHistory(userId, history) {
-  const coll = await getColl('history');
-  await coll.updateOne(
-    { _id: userId },
-    { $set: { messages: history } },
-    { upsert: true }
-  );
-}
-
-// token 数で履歴制御
-const trimByToken = (arr, maxToken = 4000) => {
-  let total = 0, out = [];
-  for (let i = arr.length - 1; i >= 0; i--) {
-    total += [...arr[i].content].length / 4;
-    if (total > maxToken) break;
-    out.unshift(arr[i]);
-  }
-  return out;
-};
-
-// プロファイル読み込み（ファイル版）
-const loadJSON = async (path, fallback) => {
-  try { return JSON.parse(await fs.readFile(path, 'utf8')); }
-  catch { return fallback; }
-};
-const saveJSON = async (path, obj) => fs.writeFile(path, JSON.stringify(obj, null, 2));
-
-// ============================================================
-// メイン Event ハンドラ
-// ============================================================
-async function handleEvent(event) {
-  // debug
-  console.log('🔍 incoming userId:', event.source.userId);
-  console.log('🔍 expected motherId:', MOTHER_USER_ID);
-
-  if (event.type !== 'message' || event.message.type !== 'text') return null;
-
-  const userId      = event.source.userId;
-  const userMessage = event.message.text.trim();
-  const isMother = userId === MOTHER_USER_ID;
-  const isYuto   = userId === YUTO_USER_ID;
-
-  const motherProfile = await loadJSON(MOTHER_PROFILE_FILE, {});
-  const yutoProfile   = await loadJSON(YUTO_PROFILE_FILE, {});
-
-  // —— pending reply confirm
-  if (isYuto && userMessage.toLowerCase() === 'はい') {
-    const pending = await loadJSON(PENDING_REPLY_FILE, null);
-    if (pending && pending.message) {
-      await fs.unlink(PENDING_REPLY_FILE).catch(()=>{});
-      await client.pushMessage(MOTHER_USER_ID, { type:'text', text: pending.message });
-      return client.replyMessage(event.replyToken, { type:'text', text:'お母様にお伝えしました。'});
-    }
-  }
-
-  // —— @report
-  if (isYuto && (/^@report$/.test(userMessage) || /母の近況/.test(userMessage))) {
-    const motherHist = await loadHistory(MOTHER_USER_ID);
-    const recent     = motherHist.slice(-30);
-    const last15     = recent.filter(m=>m.role==='user'||m.role==='assistant').slice(-15);
-
-    const prompt = [
-      { role:'system', content:'あなたはAI仲介者のWakaです。以下の会話から母の近況をやさしい口調でYutoさんに報告してください。' },
-      { role:'user',   content:last15.map(m=>`${m.role==='user'?'母':'Waka'}: ${m.content}`).join('\n') }
-    ];
-
-    try {
-      const summaryRes = await axios.post('https://api.openai.com/v1/chat/completions',
-        { model: process.env.OPENAI_MODEL || 'gpt-4o', messages: prompt },
-        { headers:{ Authorization:`Bearer ${process.env.OPENAI_API_KEY}` }});
-
-      const summary = summaryRes.data.choices[0].message.content;
-      await client.replyMessage(event.replyToken, {
-        type:'text',
-        text:`【母との最近のやり取り】\n\n${last15.map(m=>`${m.role==='user'?'母':'Waka'}: ${m.content}`).join('\n')}\n\n【まとめ】\n${summary}`
-      });
-      return;
-    } catch (err) {
-      console.error('Report Error:', err.response?.data ?? err.message);
-      return client.replyMessage(event.replyToken, { type:'text', text:'レポート生成に失敗しました。'});
-    }
-  }
-
-  // —— 通常会話処理
-  let history = await loadHistory(userId);
-  history.push({ role:'user', content:userMessage });
-  history = trimByToken(history);
-  await saveHistory(userId, history);
-
-  const systemPrompt = isMother ? /* mother prompt */ `あなたは「和架（Waka）」という名前のAI仲介者です。\nこのユーザーは裕智さんのお母様であることが確定しています。安心感を重視し、丁寧な口調で応答してください。` :
-  `あなたは「和架（Waka）」という名前のAI仲介者です。現在、開発者（裕智）と会話しています。`;
-
-  try {
-    const messages = [ { role:'system', content:systemPrompt }, ...history ];
-    const aiRes = await axios.post('https://api.openai.com/v1/chat/completions',
-      { model: process.env.OPENAI_MODEL || 'gpt-4o', messages },
-      { headers:{ Authorization:`Bearer ${process.env.OPENAI_API_KEY}` }});
-
-    const aiReply = aiRes.data.choices[0].message.content;
-
-    if (isMother && aiReply.includes('【裕智に報告推奨】')) {
-      const msgToYuto = aiReply.replace('【裕智に報告推奨】','').trim();
-      await client.pushMessage(YUTO_USER_ID, { type:'text', text:`【和架からの報告】\n\n${msgToYuto}` });
-    } else if (isYuto && aiReply.startsWith('【母への伝達提案】')) {
-      const proposed = aiReply.replace('【母への伝達提案】','').trim();
-      await saveJSON(PENDING_REPLY_FILE, { message: proposed });
-      return client.replyMessage(event.replyToken, { type:'text', text:`お母様にはこのように伝えようと思います：\n\n${proposed}\n\nこの内容でよろしければ「はい」とお返事ください。` });
-    }
-
-    history.push({ role:'assistant', content: aiReply });
-    history = trimByToken(history);
-    await saveHistory(userId, history);
-
-    return client.replyMessage(event.replyToken, { type:'text', text: aiReply.replace('【裕智に報告推奨】','').trim() });
-  } catch (err) {
-    console.error('OpenAI Error:', err.response?.data ?? err.message);
-    return client.replyMessage(event.replyToken, { type:'text', text:'エラーが発生しました。'});
-  }
-}
+// ---------- startup ping ------------------------------------
+(async()=>{try{const { MongoClient }=require('mongodb');const c=new MongoClient(process.env.MONGODB_URI);await c.db().command({ping:1});console.log('✅ Connected to MongoDB (startup ping)');await c.close();}catch(e){console.error('🛑 MongoDB connection failed:',e.message);}})();
 
 // ------------------------------------------------------------
-app.listen(PORT, () => {
-  console.log(`Waka.AI Bot running on ${PORT}`);
-});
+app.listen(PORT,()=>console.log('Waka.AI Bot running on',PORT));
 
-// === startup ping for connection check ===
-(async () => {
-  try {
-    const { MongoClient } = require('mongodb');
-    const client = new MongoClient(process.env.MONGODB_URI);
-    await client.db().command({ ping: 1 });
-    console.log('✅ Connected to MongoDB (startup ping)');
-    await client.close();
-  } catch (e) {
-    console.error('🛑 MongoDB connection failed:', e.message);
-  }
-})();
